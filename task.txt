@@ -1,0 +1,53 @@
+接口：https://search-new.civitai.com/multi-search
+请求方式：post - json
+请求体：
+{"queries":[{"q":"product design","indexUid":"images_v6","facets":["aspectRatio","baseModel","createdAtUnix","tagNames","techniqueNames","toolNames","type","user.username"],"attributesToHighlight":[],"highlightPreTag":"__ais-highlight__","highlightPostTag":"__/ais-highlight__","limit":51,"offset":50,"filter":["(poi != true) AND (NOT (nsfwLevel IN [4, 8, 16, 32] AND baseModel IN ['SD 3', 'SD 3.5', 'SD 3.5 Medium', 'SD 3.5 Large', 'SD 3.5 Large Turbo', 'SDXL Turbo', 'SVD', 'SVD XT', 'Stable Cascade'])) AND (nsfwLevel=1)"]}]}
+请求头：
+user-agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36
+authorization:Bearer 8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61
+
+响应参数：
+{
+    "results": [
+        {
+            "indexUid": "images_v6",
+            "hits": [
+                {
+                    "id": 81990337,
+                    "prompt": "An imaginative product design concept for a hot air balloon floating in the sky, innovative features, and eco-friendly technology, set against a modern urban backdrop. gold, black, and wood. \n <lora:RetroLuxe_World_Morph:1> RetroBG",
+                    "tagNames": [
+                        "city",
+                        "scenery",
+                        "sky",
+                        "ruins",
+                        "outdoors",
+                        "building",
+                        "skyscraper",
+                        "no humans",
+                        "pg"
+                    ],
+                    "type": "image",
+                    "createdAt": "2025-06-13T01:20:38.384Z",
+                    "name": "VMRF4VGS4F0DWKW5BY0D7CP0F0.jpeg",
+                    "url": "61b149c8-c650-4bbd-a115-5ad5c71a2d10"
+                }
+            ]
+        }
+    ]
+}
+
+帮忙用requests写个python爬虫脚本，自动分页，保存 prompt、createdAt、url 这三个值到本地sqllite数据库。
+
+过滤规则:
+    只要年份为2025年的
+
+    其中需要根据prompt过滤：
+    需要包含这些关键词之一：["industrial design", "product design", "product rendering"]
+    必须不能包含这些关键词：["anime", "cartoon", "fanart", "nsfw", "portrait", "fashion", "character", "woman", "man", "girl", "boy", "person", "human"]
+
+需要下载图片到 ./.cache/civitai_com_image_results 目录，图片地址拼接格式为 https://image-b2.civitai.com/file/civitai-media-cache/{上面item取的url值}/450x%3Cauto%3E_so
+
+下载图片需要传递api的请求头,
+其中接口的跟下载的请求头ua都需要改为随机ua
+请求接口跟下载都配置代理ip为 127.0.0.1:7890
+
