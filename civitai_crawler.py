@@ -1,394 +1,315 @@
 """
 Civitai图片爬虫 - 抓取产品设计和工业设计相关图片
+使用 curl 命令行工具下载图片
 """
 import os
-import sqlite3
 import time
-import random
 import argparse
+import json
+import subprocess
 import requests
 from pathlib import Path
-from typing import List, Dict, Set
+from typing import List, Dict
+from fake_useragent import UserAgent
+from dotenv import load_dotenv
+from PIL import Image, UnidentifiedImageError
 
-# 数据库路径
-DB_PATH = "./.cache/civitai_images.db"
+# 加载环境变量
+load_dotenv()
 
 
 class CivitaiCrawler:
-    # 随机User-Agent列表
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    ]
 
-    def __init__(self, db_path: str = DB_PATH):
-        """初始化爬虫"""
-        self.db_path = db_path
+    def __init__(self):
+        self.ua = UserAgent()
         self.api_url = "https://search-new.civitai.com/multi-search"
         self.auth_token = f"Bearer 8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61"
 
-        # 代理配置
-        self.proxy = "http://127.0.0.1:7890"
-        self.proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else None
+        # 使用 Session 保持会话
+        self.session = requests.Session()
 
-        # 年份过滤（只抓取2025年的数据）
-        self.target_year = 2025
+        # 从环境变量读取代理配置
+        _proxy = os.getenv("PROXY")
+        if _proxy:
+            _proxy_str = f"http://{_proxy}"
+            self.session.proxies = {"http": _proxy_str, "https": _proxy_str}
+            self.proxies = {"http": _proxy_str, "https": _proxy_str}
+        else:
+            self.proxies = None
 
-        # 关键词过滤配置
+        # 从环境变量读取代理配置
+        _proxy = os.getenv("PROXY")
+        if _proxy:
+            _proxy_str = f"http://{_proxy}"
+            self.proxies = {"http": _proxy_str, "https": _proxy_str}
+        else:
+            self.proxies = None
+            
+        self.target_years = [2025]
+        self.download_interval = 2  # 下载间隔（秒）
         self.include_keywords = ["industrial design", "product design", "product rendering"]
         self.exclude_keywords = ["anime", "cartoon", "fanart", "nsfw", "portrait", "fashion",
                                  "character", "woman", "man", "girl", "boy", "person", "human"]
-
-        # 图片保存目录
         self.image_dir = Path("./.cache/civitai_com_image_results")
         self.image_dir.mkdir(parents=True, exist_ok=True)
+        self.fail_ids_file = Path("./.cache/fail_ids")
+        self.fail_ids_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # 初始化数据库
-        self._init_db()
+    def _get_fail_ids(self) -> set:
+        """读取失败的id列表"""
+        if not self.fail_ids_file.exists():
+            return set()
+        with open(self.fail_ids_file, 'r') as f:
+            return set(line.strip() for line in f if line.strip())
+
+    def _add_fail_id(self, item_id: str):
+        """添加失败的id"""
+        fail_ids = self._get_fail_ids()
+        fail_ids.add(str(item_id))
+        with open(self.fail_ids_file, 'w') as f:
+            f.write('\n'.join(fail_ids))
+
+    def _remove_fail_id(self, item_id: str):
+        """移除已成功下载的id"""
+        fail_ids = self._get_fail_ids()
+        fail_ids.discard(str(item_id))
+        with open(self.fail_ids_file, 'w') as f:
+            f.write('\n'.join(fail_ids))
 
     def _get_headers(self) -> Dict[str, str]:
-        """获取带有随机User-Agent的请求头"""
-        return {
-            "user-agent": random.choice(self.USER_AGENTS),
-            "authorization": self.auth_token
-        }
+        return {"user-agent": self.ua.random, "authorization": self.auth_token}
 
-    def _init_db(self):
-        """初始化SQLite数据库"""
-        # 确保数据库目录存在
-        db_file = Path(self.db_path)
-        db_file.parent.mkdir(parents=True, exist_ok=True)
+    def _should_include(self, item: Dict) -> bool:
+        """检查item是否符合条件"""
+        prompt = item.get("prompt", "").lower()
+        created_at = item.get("createdAt", "")
 
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS images (
-                id INTEGER PRIMARY KEY,
-                prompt TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                url TEXT NOT NULL,
-                image_path TEXT,
-                downloaded INTEGER DEFAULT 0,
-                UNIQUE(id)
-            )
-        """)
-
-        conn.commit()
-        conn.close()
-
-    def _should_include_prompt(self, prompt: str) -> bool:
-        """
-        检查prompt是否应该被包含
-        必须包含至少一个include关键词，且不能包含任何exclude关键词
-        """
-        if not prompt:
+        # 必须包含至少一个包含关键词
+        if not any(kw in prompt for kw in self.include_keywords):
             return False
-
-        prompt_lower = prompt.lower()
-
-        # 检查是否包含至少一个必需关键词
-        has_include = any(kw in prompt_lower for kw in self.include_keywords)
-        if not has_include:
+        # 不能包含任何排除关键词
+        if any(kw in prompt for kw in self.exclude_keywords):
             return False
-
-        # 检查是否包含排除关键词
-        has_exclude = any(kw in prompt_lower for kw in self.exclude_keywords)
-        if has_exclude:
+        # 年份过滤
+        if created_at and int(created_at[:4]) not in self.target_years:
             return False
-
         return True
 
-    def _should_include_year(self, created_at: str) -> bool:
-        """检查是否为目标年份的数据"""
-        if not created_at:
-            return False
-        # createdAt格式: "2025-06-13T01:20:38.384Z"
-        return created_at.startswith(str(self.target_year))
-
-    def _save_to_db(self, items: List[Dict]) -> tuple[int, int]:
-        """
-        保存数据到数据库
-        :return: (新增数量, 跳过数量)
-        """
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        saved_count = 0
-        skipped_count = 0
-        for item in items:
-            item_id = item.get("id")
-            prompt = item.get("prompt", "")
-            created_at = item.get("createdAt", "")
-            url = item.get("url", "")
-
-            try:
-                cursor.execute(
-                    """INSERT OR IGNORE INTO images (id, prompt, created_at, url)
-                       VALUES (?, ?, ?, ?)""",
-                    (item_id, prompt, created_at, url)
-                )
-                if cursor.rowcount > 0:
-                    saved_count += 1
-                else:
-                    skipped_count += 1
-            except sqlite3.Error as e:
-                print(f"保存数据失败 (ID: {item_id}): {e}")
-
-        conn.commit()
-        conn.close()
-        return saved_count, skipped_count
-
-    def _build_request_body(self, offset: int, limit: int = 51) -> Dict:
-        """构建请求体"""
-        return {
+    def _fetch_page(self, offset: int, limit: int = 51) -> List[Dict]:
+        """获取一页数据"""
+        body = {
             "queries": [{
                 "q": "product design",
                 "indexUid": "images_v6",
-                "facets": [
-                    "aspectRatio", "baseModel", "createdAtUnix", "tagNames",
-                    "techniqueNames", "toolNames", "type", "user.username"
-                ],
+                "facets": ["aspectRatio", "baseModel", "createdAtUnix", "tagNames",
+                          "techniqueNames", "toolNames", "type", "user.username"],
                 "attributesToHighlight": [],
                 "highlightPreTag": "__ais-highlight__",
                 "highlightPostTag": "__ais-highlight__",
                 "limit": limit,
                 "offset": offset,
-                "filter": [
-                    "(poi != true) AND (NOT (nsfwLevel IN [4, 8, 16, 32] AND baseModel IN "
-                    "['SD 3', 'SD 3.5', 'SD 3.5 Medium', 'SD 3.5 Large', 'SD 3.5 Large Turbo', "
-                    "'SDXL Turbo', 'SVD', 'SVD XT', 'Stable Cascade'])) AND (nsfwLevel=1)"
-                ]
+                "filter": ["(poi != true) AND (NOT (nsfwLevel IN [4, 8, 16, 32] AND baseModel IN "
+                          "['SD 3', 'SD 3.5', 'SD 3.5 Medium', 'SD 3.5 Large', 'SD 3.5 Large Turbo', "
+                          "'SDXL Turbo', 'SVD', 'SVD XT', 'Stable Cascade'])) AND (nsfwLevel=1)"]
             }]
         }
-
-    def fetch_page(self, offset: int = 0, limit: int = 51) -> List[Dict]:
-        """
-        获取一页数据
-        返回通过prompt过滤后的item列表
-        """
         try:
-            print(f"正在爬取: offset={offset}, limit={limit}")
             response = requests.post(
-                self.api_url,
-                json=self._build_request_body(offset, limit),
-                headers=self._get_headers(),
-                proxies=self.proxies,
-                timeout=30
+                self.api_url, json=body, headers=self._get_headers(),
+                proxies=self.proxies, timeout=30
             )
             response.raise_for_status()
-            data = response.json()
-
-            hits = data.get("results", [{}])[0].get("hits", [])
-
-            # 过滤prompt和年份
-            filtered_items = []
-            for item in hits:
-                if not self._should_include_prompt(item.get("prompt", "")):
-                    continue
-                if not self._should_include_year(item.get("createdAt", "")):
-                    continue
-                filtered_items.append(item)
-
-            print(f"页码偏移 {offset}: 获取 {len(hits)} 条，过滤后 {len(filtered_items)} 条")
-
-            return filtered_items, hits
-
+            hits = response.json().get("results", [{}])[0].get("hits", [])
+            return [item for item in hits if self._should_include(item)], hits
         except requests.RequestException as e:
-            print(f"请求失败 (offset={offset}): {e}")
+            print(f"请求失败: {e}")
             return [], []
 
-    def _download_items(self, items: List[Dict]) -> tuple[int, int, int]:
+    def _validate_image(self, path: Path) -> tuple[bool, str]:
         """
-        下载指定列表中的图片
-        :return: (成功数量, 失败数量, 跳过数量)
+        验证下载的图片完整性
+        返回: (是否有效, 错误信息)
         """
-        if not items:
-            return 0, 0, 0
+        try:
+            # 检查文件大小
+            file_size = path.stat().st_size
+            if file_size == 0:
+                return False, "文件大小为0"
 
-        success_count = 0
-        failed_count = 0
-        skipped_count = 0
+            # 最小图片大小检查（防止损坏的微型文件）
+            min_size = 1024  # 1KB
+            if file_size < min_size:
+                return False, f"文件过小 ({file_size} bytes)"
 
-        for item in items:
-            item_id = item.get("id")
-            url = item.get("url", "")
+            # 尝试打开并验证图片
+            with Image.open(path) as img:
+                # 验证图片可以正常加载
+                img.verify()
 
-            # 检查图片文件是否已存在
-            ext = os.path.splitext(url.split("/")[-1])[1] or ".jpg"
-            save_path = self.image_dir / f"{item_id}{ext}"
+            # verify()会关闭文件，需要重新打开检查
+            with Image.open(path) as img:
+                # 检查图片尺寸是否有效
+                width, height = img.size
+                if width < 1 or height < 1:
+                    return False, f"无效的图片尺寸 ({width}x{height})"
 
-            if save_path.exists():
-                # 文件已存在，跳过下载
-                skipped_count += 1
-                continue
+                # 尝试加载像素数据（确保图片数据完整）
+                img.load()
 
-            image_url = self.get_image_url(url)
-            if self.download_image(image_url, save_path):
-                self._update_download_status(item_id, str(save_path))
-                success_count += 1
+            return True, ""
+
+        except UnidentifiedImageError:
+            return False, "无法识别的图片格式"
+        except OSError as e:
+            return False, f"图片损坏: {str(e)}"
+        except Exception as e:
+            return False, f"验证失败: {str(e)}"
+
+    def _download_with_curl(self, url: str, path: Path) -> bool:
+        """使用 curl 命令行工具下载图片"""
+        try:
+            cmd = [
+                "curl",
+                f"-Huser-agent: {self.ua.random}",
+                f"-Hauthorization: {self.auth_token}",
+                "-Hreferer: https://civitai.com/",
+                "-Haccept: image/*",
+                "-L",  # 跟随重定向
+                "-s",  # 静默模式
+                "-k",  # 跳过证书验证
+                "-o", str(path),
+                url,
+            ]
+
+            # 添加代理
+            if self.proxies:
+                proxy_url = self.proxies.get("https") or self.proxies.get("http")
+                if proxy_url:
+                    cmd.insert(-1, "-x")
+                    cmd.insert(-1, proxy_url)
+
+            result = subprocess.run(cmd, capture_output=True, timeout=60)
+
+            if result.returncode == 0 and path.exists() and path.stat().st_size > 0:
+                return True
             else:
-                failed_count += 1
+                print(f"  [curl] 下载失败 (return code: {result.returncode})")
+                if result.stderr:
+                    error_msg = result.stderr.decode('utf-8', errors='ignore')
+                    if '401' in error_msg:
+                        print(f"  [curl] 认证失败 (401)")
+                    else:
+                        print(f"  [curl] 错误: {error_msg[:200]}")
+                        
+                time.sleep(0.5)
+                
+                return False
+        except FileNotFoundError:
+            print("  [curl] 未安装 curl")
+            return False
+        except Exception as e:
+            print(f"  [curl] 失败: {e}")
+            return False
 
-            time.sleep(0.1)
+    def _save_item(self, item: Dict) -> bool:
+        """保存单个item（图片+json）"""
+        url = item.get("url", "")
+        item_id = item.get("id")
+        created_at = item.get("createdAt", "")
+        year = created_at[:4] if created_at else "unknown"
 
-        return success_count, failed_count, skipped_count
+        base_name = os.path.splitext(url.rstrip("/").split("/")[-1])[0]
+        ext = os.path.splitext(url.rstrip("/").split("/")[-1])[1] or ".jpg"
 
-    def _update_download_status(self, item_id: int, image_path: str):
-        """更新图片下载状态"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE images SET image_path = ?, downloaded = 1 WHERE id = ?",
-            (image_path, item_id)
-        )
-        conn.commit()
-        conn.close()
+        # 文件名添加年份前缀
+        filename = f"{year}_{base_name}"
+        image_path = self.image_dir / f"{filename}{ext}"
+        json_path = self.image_dir / f"{filename}.json"
 
-    def crawl(self, max_pages: int = None, items_per_page: int = 51, download_images: bool = True):
-        """
-        爬取数据
-        :param max_pages: 最大爬取页数，None表示无限翻页直到没有新数据
-        :param items_per_page: 每页条数
-        :param download_images: 是否边爬取边下载图片，默认True
-        """
-        print(f"开始爬取 Civitai 图片数据...")
-        print(f"目标年份: {self.target_year}")
-        print(f"包含关键词: {self.include_keywords}")
-        print(f"排除关键词: {self.exclude_keywords}")
-        print(f"边爬取边下载: {'是' if download_images else '否'}")
+        # 检查文件是否已存在
+        if image_path.exists() and json_path.exists():
+            return False  # 已存在，跳过
+
+        # 构建图片 URL
+        image_url = f"https://image-b2.civitai.com/file/civitai-media-cache/{url}/original"
+
+        # 使用 curl 下载图片
+        print(f"  下载中...", end=" ")
+        if not self._download_with_curl(image_url, image_path):
+            self._add_fail_id(item_id)
+            print(f"下载失败: ID={item_id}")
+            return False
+
+        # 验证图片完整性
+        is_valid, error_msg = self._validate_image(image_path)
+        if not is_valid:
+            # 删除损坏的文件
+            if image_path.exists():
+                image_path.unlink()
+            self._add_fail_id(item_id)
+            print(f"校验失败: {error_msg}, ID={item_id} \n 下载地址: {image_url} \n 详情地址: https://civitai.com/images/{item_id} \n")
+            time.sleep(0.5)
+            return False
+
+        print("成功!")
+
+        # 保存json
+        json_data = {
+            "id": item.get("id"),
+            "prompt": item.get("prompt", ""),
+            "createdAt": item.get("createdAt", ""),
+            "url": url,
+            "aspectRatio": item.get("aspectRatio", ""),
+        }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+
+        # 成功后从失败列表移除
+        self._remove_fail_id(item_id)
+        return True
+
+    def crawl(self, max_pages: int = None, items_per_page: int = 51):
+        """爬取数据并下载图片"""
+        print(f"开始爬取 Civitai 图片...")
+        print(f"目标年份: {self.target_years}")
+        print(f"关键词: {self.include_keywords}")
 
         offset = 0
         page_count = 0
-        total_saved = 0
+        total_found = 0
         total_downloaded = 0
 
         while True:
             if max_pages and page_count >= max_pages:
-                print(f"已达到最大页数限制: {max_pages}")
                 break
 
-            items, hits = self.fetch_page(offset, items_per_page)
-
+            items, hits = self._fetch_page(offset, items_per_page)
+            
             if not hits:
-                print("没有更多数据，爬取结束")
+                print("没有更多数据")
                 break
+            
+            if not items:
+                continue
 
             page_count += 1
             offset += items_per_page
+            total_found += len(items)
 
-            if not items:
-                print(f"第 {page_count} 页: 过滤后无符合条件的数据，跳过")
-                continue
+            # 下载
+            downloaded = sum(1 for item in items if self._save_item(item))
+            skipped = len(items) - downloaded
+            total_downloaded += downloaded
 
-            # 保存到数据库
-            saved, duplicate = self._save_to_db(items)
-            total_saved += saved
+            print(f"第{page_count}页: 找到{len(items)}条, 下载{downloaded}张, 跳过{skipped}张")
+            time.sleep(self.download_interval)
 
-            # 下载图片
-            downloaded = 0
-            failed = 0
-            skipped = 0
-            if download_images:
-                downloaded, failed, skipped = self._download_items(items)
-                total_downloaded += downloaded
-
-            status_parts = [f"新增 {saved} 条"]
-            if duplicate > 0:
-                status_parts.append(f"重复 {duplicate} 条")
-            if download_images:
-                status_parts.append(f"下载 {downloaded} 张")
-                if failed > 0:
-                    status_parts.append(f"失败 {failed} 张")
-                if skipped > 0:
-                    status_parts.append(f"跳过 {skipped} 张")
-            print(f"第 {page_count} 页: {', '.join(status_parts)}，累计新增 {total_saved} 条")
-
-            # 避免请求过快
-            time.sleep(0.3)
-
-        print(f"\n爬取完成! 共保存 {total_saved} 条数据，下载 {total_downloaded} 张图片")
-
-    def get_image_url(self, url: str) -> str:
-        """构建完整的图片URL"""
-        return f"https://image-b2.civitai.com/file/civitai-media-cache/{url}/450x%3Cauto%3E_so"
-
-    def download_image(self, url: str, save_path: str) -> bool:
-        """下载单张图片"""
-        try:
-            response = requests.get(url, headers=self._get_headers(), proxies=self.proxies, timeout=30)
-            response.raise_for_status()
-
-            with open(save_path, 'wb') as f:
-                f.write(response.content)
-            return True
-
-        except Exception as e:
-            print(f"下载失败 {url}: {e}")
-            return False
-
-    def download_all_images(self):
-        """下载所有未下载的图片"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT id, url, downloaded FROM images WHERE downloaded = 0")
-        items = cursor.fetchall()
-
-        if not items:
-            print("没有需要下载的图片")
-            conn.close()
-            return
-
-        print(f"准备下载 {len(items)} 张图片...")
-        success_count = 0
-
-        for item_id, url, _ in items:
-            image_url = self.get_image_url(url)
-            # 使用id作为文件名，保持原始扩展名
-            ext = os.path.splitext(url.split("/")[-1])[1] or ".jpg"
-            save_path = self.image_dir / f"{item_id}{ext}"
-
-            if self.download_image(image_url, save_path):
-                cursor.execute(
-                    "UPDATE images SET image_path = ?, downloaded = 1 WHERE id = ?",
-                    (str(save_path), item_id)
-                )
-                success_count += 1
-                print(f"[{success_count}/{len(items)}] 下载完成: {item_id}{ext}")
-
-            time.sleep(0.2)  # 避免请求过快
-
-        conn.commit()
-        conn.close()
-        print(f"\n下载完成! 成功下载 {success_count}/{len(items)} 张图片")
+        print(f"\n完成! 共找到{total_found}条, 下载{total_downloaded}张")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Civitai图片爬虫")
-    parser.add_argument("--download-only", action="store_true", help="仅下载图片，不爬取新数据")
-    parser.add_argument("--crawl-only", action="store_true", help="仅爬取数据，不下载图片")
-    parser.add_argument("--max-pages", type=int, default=None, help="最大爬取页数，默认无限翻页")
+    parser.add_argument("--max-pages", type=int, default=None, help="最大爬取页数")
     args = parser.parse_args()
 
-    crawler = CivitaiCrawler()
-
-    if args.download_only:
-        # 仅下载图片
-        print("模式: 仅下载图片")
-        crawler.download_all_images()
-    elif args.crawl_only:
-        # 仅爬取数据
-        print("模式: 仅爬取数据")
-        crawler.crawl(max_pages=args.max_pages, items_per_page=51, download_images=False)
-    else:
-        # 默认：边爬取边下载
-        print("模式: 边爬取边下载")
-        crawler.crawl(max_pages=args.max_pages, items_per_page=51, download_images=True)
+    CivitaiCrawler().crawl(max_pages=args.max_pages)

@@ -56,3 +56,6 @@ Thumbs.db
 
 # custom
 .cache
+.vscode/
+.claude/
+.env
