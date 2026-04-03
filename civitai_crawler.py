@@ -3,6 +3,7 @@ Civitai图片爬虫 - 抓取产品设计和工业设计相关图片
 使用 requests 流式下载图片，支持动态获取 CDN key 和重试机制
 """
 import os
+import errno
 import time
 import argparse
 import json
@@ -104,6 +105,13 @@ class CivitaiCrawler:
         self.cache_dir = Path("./.cache/download_cache")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
+        # 进度文件
+        self.progress_file = Path("./.cache/crawl_progress.json")
+        self.progress_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # CDN key 更新标志（避免频繁更新）
+        self.cdn_key_updated = False
+
     def _get_fail_ids(self) -> set:
         """读取失败的id列表"""
         if not self.fail_ids_file.exists():
@@ -125,6 +133,48 @@ class CivitaiCrawler:
         with open(self.fail_ids_file, 'w') as f:
             f.write('\n'.join(fail_ids))
 
+    def _update_cdn_key(self):
+        """更新 CDN key"""
+        logger.info("尝试更新 CDN Key...")
+        old_key = self.cdn_key
+        self.cdn_key = get_cdn_key()
+        self.cdn_key_updated = True
+        if old_key != self.cdn_key:
+            logger.info(f"CDN Key 已更新: {old_key[:10]}... -> {self.cdn_key[:10]}...")
+        else:
+            logger.info("CDN Key 未发生变化")
+
+    def _save_progress(self, page_count: int, offset: int, total_found: int, total_downloaded: int):
+        """保存爬取进度"""
+        progress_data = {
+            "page_count": page_count,
+            "offset": offset,
+            "total_found": total_found,
+            "total_downloaded": total_downloaded,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        try:
+            with open(self.progress_file, 'w', encoding='utf-8') as f:
+                json.dump(progress_data, f, ensure_ascii=False, indent=2)
+            logger.debug(f"进度已保存: 第{page_count}页, offset={offset}")
+        except Exception as e:
+            logger.warning(f"保存进度失败: {e}")
+
+    def _load_progress(self) -> dict:
+        """读取爬取进度"""
+        if not self.progress_file.exists():
+            return None
+        try:
+            with open(self.progress_file, 'r', encoding='utf-8') as f:
+                progress = json.load(f)
+            logger.info(f"发现上次的进度: 第{progress.get('page_count')}页, "
+                       f"已找到{progress.get('total_found')}条, 已下载{progress.get('total_downloaded')}张")
+            logger.info(f"上次爬取时间: {progress.get('timestamp')}")
+            return progress
+        except Exception as e:
+            logger.warning(f"读取进度文件失败: {e}")
+            return None
+
     def _get_headers(self) -> Dict[str, str]:
         return {"user-agent": self.ua.random, "authorization": self.auth_token}
 
@@ -144,8 +194,11 @@ class CivitaiCrawler:
             return False
         return True
 
-    def _fetch_page(self, offset: int, limit: int = 51) -> List[Dict]:
-        """获取一页数据"""
+    def _fetch_page(self, offset: int, limit: int = 51, max_retries: int = 5) -> List[Dict]:
+        """
+        获取一页数据（支持指数退避重试）
+        连接错误时会尝试更新 CDN key
+        """
         body = {
             "queries": [{
                 "q": "product design",
@@ -162,17 +215,44 @@ class CivitaiCrawler:
                           "'SDXL Turbo', 'SVD', 'SVD XT', 'Stable Cascade'])) AND (nsfwLevel=1)"]
             }]
         }
-        try:
-            response = requests.post(
-                self.api_url, json=body, headers=self._get_headers(),
-                proxies=self.proxies, timeout=30
-            )
-            response.raise_for_status()
-            hits = response.json().get("results", [{}])[0].get("hits", [])
-            return [item for item in hits if self._should_include(item)], hits
-        except requests.RequestException as e:
-            print(f"请求失败: {e}")
-            return [], []
+
+        cdn_updated = False  # 标记是否已更新过 CDN key
+
+        for attempt in range(max_retries):
+            try:
+                response = requests.post(
+                    self.api_url, json=body, headers=self._get_headers(),
+                    proxies=self.proxies, timeout=30
+                )
+                response.raise_for_status()
+                hits = response.json().get("results", [{}])[0].get("hits", [])
+                return [item for item in hits if self._should_include(item)], hits
+
+            except requests.RequestException as e:
+                error_str = str(e)
+                is_connection_error = (
+                    'ConnectionResetError' in error_str or
+                    'Connection aborted' in error_str or
+                    '远程主机强迫关闭' in error_str or
+                    errno.ECONNRESET in getattr(e, 'errno', 0)
+                )
+
+                # 判断是否需要重试
+                if attempt < max_retries - 1:
+                    # 如果是连接错误且尚未更新过 CDN key，尝试更新
+                    if is_connection_error and not cdn_updated and attempt >= 2:
+                        logger.warning(f"检测到连接错误，尝试更新 CDN Key...")
+                        self._update_cdn_key()
+                        cdn_updated = True
+
+                    # 指数退避: 2^attempt 秒 (1, 2, 4, 8, 16)
+                    wait_time = 2 ** attempt
+                    logger.warning(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    logger.info(f"等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"请求失败，已重试 {max_retries} 次: {e}")
+                    return [], []
 
     def _validate_image(self, path: Path) -> tuple[bool, str]:
         """
@@ -319,6 +399,7 @@ class CivitaiCrawler:
         """
         保存单个item（图片+json）
         使用新的下载方式（参考 CivitAI-Collection-Downloader）
+        下载失败时会尝试更新 CDN key 并重试
         """
         url = item.get("url", "")
         item_id = item.get("id")
@@ -338,15 +419,39 @@ class CivitaiCrawler:
             logger.debug(f"文件已存在，跳过: {filename}")
             return False  # 已存在，跳过
 
-        # 构建图片 URL（使用动态 CDN key）
-        # 参考: https://image.civitai.com/{cdn_key}/{url}/original=true
-        image_url = f"https://image.civitai.com/{self.cdn_key}/{url}/original=true"
+        # 下载尝试（包括更新 CDN key 后重试）
+        download_success = False
+        image_url = ""
 
-        logger.info(f"正在下载图片: {image_url}")
-        logger.debug(f"图片 URL: {image_url}")
+        for attempt in range(2):  # 最多尝试2次（第一次 + 更新CDN后重试）
+            # 构建图片 URL（使用当前 CDN key）
+            # 参考: https://image.civitai.com/{cdn_key}/{url}/original=true
+            image_url = f"https://image.civitai.com/{self.cdn_key}/{url}/original=true"
 
-        # 使用 requests 流式下载
-        if not self._download_with_requests(image_url, image_path):
+            if attempt == 0:
+                logger.info(f"正在下载图片: {filename}")
+            else:
+                logger.info(f"使用新 CDN Key 重试下载: {filename}")
+
+            logger.debug(f"图片 URL: {image_url}")
+
+            # 使用 requests 流式下载
+            if self._download_with_requests(image_url, image_path):
+                download_success = True
+                break
+            else:
+                # 第一次下载失败，尝试更新 CDN key
+                if attempt == 0:
+                    logger.warning(f"下载失败，尝试更新 CDN Key 后重试...")
+                    self._update_cdn_key()
+                    # 清理可能残留的临时文件
+                    if image_path.with_suffix('.tmp').exists():
+                        image_path.with_suffix('.tmp').unlink()
+                else:
+                    # 第二次（更新 CDN 后）仍然失败
+                    logger.error(f"更新 CDN Key 后仍然下载失败: ID={item_id}")
+
+        if not download_success:
             self._add_fail_id(item_id)
             logger.error(f"下载失败: ID={item_id}")
             logger.info(f"详情地址: https://civitai.com/images/{item_id}")
@@ -381,54 +486,94 @@ class CivitaiCrawler:
         self._remove_fail_id(item_id)
         return True
 
-    def crawl(self, max_pages: int = None, items_per_page: int = 51):
-        """爬取数据并下载图片"""
+    def crawl(self, max_pages: int = None, items_per_page: int = 51, restart: bool = False):
+        """
+        爬取数据并下载图片
+
+        Args:
+            max_pages: 最大爬取页数
+            items_per_page: 每页条目数
+            restart: 是否重新开始（忽略上次进度）
+        """
         logger.info("开始爬取 Civitai 图片...")
         logger.info(f"目标年份: {self.target_years}")
         logger.info(f"关键词: {self.include_keywords}")
         logger.info(f"CDN Key: {self.cdn_key[:10]}...")  # 只显示前10个字符
 
+        # 初始化偏移量和计数
         offset = 0
         page_count = 0
         total_found = 0
         total_downloaded = 0
 
-        while True:
-            if max_pages and page_count >= max_pages:
-                logger.info(f"已达到最大页数限制: {max_pages}")
-                break
+        # 尝试恢复进度（除非指定 restart）
+        if not restart:
+            progress = self._load_progress()
+            if progress:
+                page_count = progress.get("page_count", 0)
+                offset = progress.get("offset", 0)
+                total_found = progress.get("total_found", 0)
+                total_downloaded = progress.get("total_downloaded", 0)
+                logger.info(f"从第 {page_count + 1} 页继续爬取...")
+        else:
+            logger.info("重新开始爬取（忽略上次进度）")
+            # 清空进度文件
+            if self.progress_file.exists():
+                self.progress_file.unlink()
 
-            items, hits = self._fetch_page(offset, items_per_page)
+        try:
+            while True:
+                if max_pages and page_count >= max_pages:
+                    logger.info(f"已达到最大页数限制: {max_pages}")
+                    break
 
-            if not hits:
-                logger.info("没有更多数据")
-                break
+                items, hits = self._fetch_page(offset, items_per_page)
 
-            if not items:
-                logger.debug("当前页没有符合条件的项目，继续下一页")
+                if not hits:
+                    logger.info("没有更多数据")
+                    break
+
+                if not items:
+                    logger.debug("当前页没有符合条件的项目，继续下一页")
+                    offset += items_per_page
+                    continue
+
+                page_count += 1
                 offset += items_per_page
-                continue
+                total_found += len(items)
 
-            page_count += 1
-            offset += items_per_page
-            total_found += len(items)
+                logger.info(f"第{page_count}页: 找到 {len(items)} 条符合条件的")
 
-            logger.info(f"第{page_count}页: 找到 {len(items)} 条符合条件的")
+                # 下载
+                downloaded = sum(1 for item in items if self._save_item(item))
+                skipped = len(items) - downloaded
+                total_downloaded += downloaded
 
-            # 下载
-            downloaded = sum(1 for item in items if self._save_item(item))
-            skipped = len(items) - downloaded
-            total_downloaded += downloaded
+                logger.info(f"第{page_count}页完成: 下载 {downloaded} 张, 跳过 {skipped} 张")
 
-            logger.info(f"第{page_count}页完成: 下载 {downloaded} 张, 跳过 {skipped} 张")
-            time.sleep(self.download_interval)
+                # 保存进度
+                save_page = page_count - 1 if page_count > 0 else 0
+                self._save_progress(save_page, offset, total_found, total_downloaded)
 
-        logger.info(f"爬取完成! 共找到 {total_found} 条, 下载 {total_downloaded} 张")
+                time.sleep(self.download_interval)
+
+            logger.info(f"爬取完成! 共找到 {total_found} 条, 下载 {total_downloaded} 张")
+
+        except KeyboardInterrupt:
+            logger.info("\n用户中断爬取，进度已保存")
+            logger.info(f"当前进度: 第 {page_count} 页, 已下载 {total_downloaded} 张")
+            logger.info("下次运行时会从上次进度继续，如需重新开始请使用 --restart 参数")
+            raise
+
+        finally:
+            # 爬取完成或中断后，保存最终进度
+            self._save_progress(page_count, offset, total_found, total_downloaded)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Civitai图片爬虫")
     parser.add_argument("--max-pages", type=int, default=None, help="最大爬取页数")
+    parser.add_argument("--restart", action="store_true", help="重新开始爬取（忽略上次进度）")
     args = parser.parse_args()
 
-    CivitaiCrawler().crawl(max_pages=args.max_pages)
+    CivitaiCrawler().crawl(max_pages=args.max_pages, restart=args.restart)
