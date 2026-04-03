@@ -409,6 +409,7 @@ class CivitaiCrawler:
         user = item.get("user", {}) or {}
         json_data = {
             "id": item.get("id"),
+            "postId": item.get("postId"),
             "prompt": item.get("prompt", ""),
             "type": item.get("type", ""),
             "generationProcess": item.get("generationProcess", ""),
