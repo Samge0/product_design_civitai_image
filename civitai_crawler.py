@@ -180,7 +180,7 @@ class CivitaiCrawler:
 
     def _should_include(self, item: Dict) -> bool:
         """检查item是否符合条件"""
-        prompt = item.get("prompt", "").lower()
+        prompt = (item.get("prompt") or "").lower()
         created_at = item.get("createdAt", "")
 
         # 必须包含至少一个包含关键词
