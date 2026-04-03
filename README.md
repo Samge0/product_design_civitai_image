@@ -55,10 +55,34 @@ python civitai_crawler.py --restart
 python civitai_crawler.py --restart --max-pages 5
 ```
 
+### 检查图片和 JSON 一致性
+
+```bash
+python civitai_crawler.py --check
+```
+
+查看缺失 JSON 的图片文件，方便判断是否需要补全数据。
+
+### 备份并更新 JSON 文件
+
+当 JSON 格式更新时，可以备份旧 JSON 并让爬虫自动补全新格式：
+
+```bash
+# 1. 检查一致性
+python civitai_crawler.py --check
+
+# 2. 备份现有 JSON 文件（备份后自动删除原 JSON）
+python civitai_crawler.py --backup-json
+
+# 3. 重新运行爬虫，自动为已下载的图片补全新格式的 JSON
+python civitai_crawler.py
+```
+
 ### 中断恢复
 
 - 按 `Ctrl+C` 中断爬取，进度会自动保存
 - 下次运行会从上次位置继续
+- JSON 文件会自动补全：图片已存在但 JSON 缺失时，仅更新 JSON
 
 ## 命令行参数
 
@@ -66,6 +90,8 @@ python civitai_crawler.py --restart --max-pages 5
 |------|------|
 | `--max-pages N` | 最大爬取页数 |
 | `--restart` | 重新开始（忽略上次进度） |
+| `--check` | 检查图片和 JSON 一致性 |
+| `--backup-json` | 备份现有 JSON 文件并删除原文件 |
 
 ## 项目结构
 
@@ -78,7 +104,9 @@ python civitai_crawler.py --restart --max-pages 5
     ├── crawl_progress.json  # 爬取进度文件
     ├── fail_ids            # 失败记录
     ├── download_cache/      # 下载缓存
-    └── civitai_com_image_results/  # 下载的图片
+    └── civitai_com_image_results_2025/  # 下载的图片
+        └── .backup/         # JSON 备份目录
+            └── bak_YYYYMMDDHHMMSS/  # 按时间戳命名的备份
 ```
 
 ## 配置说明
@@ -108,10 +136,28 @@ CIVITAI_CDN_KEY=your_key_here
 
 1. 请确保遵守 Civitai 的使用条款和服务协议
 2. 建议配置代理以避免 IP 限制
-3. 图片默认保存在 `.cache/civitai_com_image_results/` 目录
+3. 图片默认保存在 `.cache/civitai_com_image_results_2025/` 目录
 4. 文件名格式：`{年份}_{id}_{uuid}.jpg`
 5. 已下载的图片会自动跳过，不会重复下载
 6. 请求失败会自动重试（最多 5 次，指数退避）
+7. **JSON 自动补全**：图片已存在但 JSON 缺失时，仅更新 JSON，不重新下载图片
+
+## JSON 文件说明
+
+每张图片都配有同名的 `.json` 文件，包含以下元数据：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 图片 ID |
+| `prompt` | 提示词 |
+| `type` | 类型（如 "image"） |
+| `generationProcess` | 生成过程（如 "txt2img"） |
+| `createdAt` | 创建时间 |
+| `name` | 原始文件名 |
+| `aspectRatio` | 宽高比 |
+| `user.id` | 用户 ID |
+| `user.username` | 用户名 |
+| `baseModel` | 基础模型 |
 
 ## 依赖项
 

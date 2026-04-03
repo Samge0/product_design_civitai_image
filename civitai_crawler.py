@@ -96,7 +96,9 @@ class CivitaiCrawler:
         self.include_keywords = ["industrial design", "product design", "product rendering","product"]
         self.exclude_keywords = ["anime", "cartoon", "fanart", "nsfw", "portrait",
                                  "character", "woman", "man", "girl", "boy", "person", "human","animal","furry","girl"]
-        self.image_dir = Path("./.cache/civitai_com_image_results_2025")
+        # 根据目标年份生成目录名（降序排列并用下划线连接）
+        years_suffix = "_".join(str(y) for y in sorted(self.target_years, reverse=True))
+        self.image_dir = Path(f"./.cache/civitai_com_image_results_{years_suffix}")
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.fail_ids_file = Path("./.cache/fail_ids")
         self.fail_ids_file.parent.mkdir(parents=True, exist_ok=True)
@@ -402,6 +404,26 @@ class CivitaiCrawler:
         logger.error(f"下载失败，已重试 {max_retries} 次: {url}")
         return False
 
+    def _save_json(self, item: Dict, json_path: Path):
+        """保存 JSON 元数据"""
+        user = item.get("user", {}) or {}
+        json_data = {
+            "id": item.get("id"),
+            "prompt": item.get("prompt", ""),
+            "type": item.get("type", ""),
+            "generationProcess": item.get("generationProcess", ""),
+            "createdAt": item.get("createdAt", ""),
+            "name": item.get("name", ""),
+            "aspectRatio": item.get("aspectRatio", ""),
+            "user": {
+                "id": user.get("id"),
+                "username": user.get("username", "")
+            },
+            "baseModel": item.get("baseModel", ""),
+        }
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, ensure_ascii=False, indent=2)
+
     def _save_item(self, item: Dict) -> bool:
         """
         保存单个item（图片+json）
@@ -425,6 +447,13 @@ class CivitaiCrawler:
         if image_path.exists() and json_path.exists():
             logger.debug(f"文件已存在，跳过: {filename}")
             return False  # 已存在，跳过
+
+        # 如果图片已存在但 JSON 缺失，只更新 JSON
+        if image_path.exists() and not json_path.exists():
+            logger.info(f"图片已存在，仅更新 JSON: {filename}")
+            self._save_json(item, json_path)
+            self._remove_fail_id(item_id)
+            return True
 
         # 下载尝试（包括更新 CDN key 后重试）
         download_success = False
@@ -479,15 +508,7 @@ class CivitaiCrawler:
         logger.info(f"下载成功: {filename} | https://civitai.com/images/{item_id}")
 
         # 保存json
-        json_data = {
-            "id": item.get("id"),
-            "prompt": item.get("prompt", ""),
-            "createdAt": item.get("createdAt", ""),
-            "url": url,
-            "aspectRatio": item.get("aspectRatio", ""),
-        }
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(json_data, f, ensure_ascii=False, indent=2)
+        self._save_json(item, json_path)
 
         # 成功后从失败列表移除
         self._remove_fail_id(item_id)
@@ -578,11 +599,110 @@ class CivitaiCrawler:
             # 爬取完成或中断后，保存最终进度
             self._save_progress(page_count, offset, total_found, total_downloaded)
 
+    def backup_json_files(self):
+        """备份现有的 JSON 文件到 .backup 目录"""
+        from datetime import datetime
+
+        logger.info("=" * 60)
+        logger.info("备份 JSON 文件")
+        logger.info("=" * 60)
+        logger.info(f"目标目录: {self.image_dir}")
+
+        # 获取所有 JSON 文件
+        json_files = list(self.image_dir.glob("*.json"))
+        if not json_files:
+            logger.info("没有找到 JSON 文件")
+            return
+
+        logger.info(f"找到 {len(json_files)} 个 JSON 文件")
+
+        # 用户确认
+        confirm = input("\n请输入 'yes' 确认备份: ").strip()
+        if confirm.lower() != "yes":
+            logger.info("操作已取消")
+            return
+
+        # 创建备份目录
+        backup_dir = self.image_dir / ".backup" / f"bak_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # 复制到备份目录
+        for json_file in json_files:
+            shutil.copy2(json_file, backup_dir / json_file.name)
+
+        logger.info(f"备份完成: {backup_dir}")
+        logger.info(f"已备份 {len(json_files)} 个 JSON 文件")
+
+        # 删除原 JSON 文件
+        logger.info("正在删除原 JSON 文件...")
+        for json_file in json_files:
+            json_file.unlink()
+
+        logger.info(f"已删除 {len(json_files)} 个原 JSON 文件")
+        logger.info("下次运行爬虫时会自动补全 JSON 文件")
+        logger.info("=" * 60)
+
+    def check_consistency(self):
+        """检查图片文件和 JSON 文件的一致性"""
+        logger.info("=" * 60)
+        logger.info("检查图片和 JSON 一致性")
+        logger.info("=" * 60)
+        logger.info(f"目标目录: {self.image_dir}")
+
+        # 获取所有图片文件（排除 .backup 目录）
+        image_extensions = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+        image_files = [
+            f for f in self.image_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in image_extensions
+        ]
+
+        if not image_files:
+            logger.info("没有找到图片文件")
+            return
+
+        total_images = len(image_files)
+        missing_json = []
+        has_json_count = 0
+
+        for image_file in image_files:
+            json_file = image_file.with_suffix(".json")
+            if json_file.exists():
+                has_json_count += 1
+            else:
+                missing_json.append(image_file.name)
+
+        logger.info("=" * 60)
+        logger.info(f"总图片数: {total_images}")
+        logger.info(f"有 JSON: {has_json_count}")
+        logger.info(f"缺失 JSON: {len(missing_json)}")
+        logger.info(f"图片&JSON一致性: {has_json_count}/{total_images} ({has_json_count/total_images*100:.1f}%)")
+        logger.info("=" * 60)
+
+        if missing_json:
+            logger.info(f"\n缺失 JSON 的图片文件 ({len(missing_json)} 个):")
+            for name in missing_json:
+                logger.info(f"  - {name}")
+                
+            if len(missing_json) > 20: # 单独再打印一次方便在底部查看
+                logger.info(f"图片&JSON一致性: {has_json_count}/{total_images} ({has_json_count/total_images*100:.1f}%)")
+        else:
+            logger.info("\n✓ 所有图片都有对应的 JSON 文件")
+        logger.info("=" * 60)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Civitai图片爬虫")
     parser.add_argument("--max-pages", type=int, default=None, help="最大爬取页数")
     parser.add_argument("--restart", action="store_true", help="重新开始爬取（忽略上次进度）")
+    parser.add_argument("--backup-json", action="store_true", help="备份现有 JSON 文件")
+    parser.add_argument("--check", action="store_true", help="检查图片和 JSON 一致性")
     args = parser.parse_args()
 
-    CivitaiCrawler().crawl(max_pages=args.max_pages, restart=args.restart)
+    crawler = CivitaiCrawler()
+
+    if args.backup_json:
+        crawler.backup_json_files()
+    elif args.check:
+        crawler.check_consistency()
+    else:
+        crawler.crawl(max_pages=args.max_pages, restart=args.restart)
