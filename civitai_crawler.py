@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 def get_cdn_key() -> str:
     """
-    自动从 CivitAI 首页获取 CDN key
+    通过 CivitAI API 自动获取 CDN key
     如果失败则使用已知的 fallback key
     """
     # 先检查环境变量
@@ -41,25 +41,29 @@ def get_cdn_key() -> str:
         return env_key.strip()
 
     logger.info("尝试自动获取 CDN Key...")
-    url = "https://civitai.com/"
+    url = f"https://civitai.com/api/v1/images?limit=1&_={int(time.time())}"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": UserAgent().random
     }
 
     try:
         response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        content = response.text
+        data = response.json()
 
-        # 查找 pattern: https://image.civitai.com/{KEY}/
-        matches = re.findall(r'https://image\.civitai\.com/([^/]+)/', content)
+        # 从返回的 JSON 中提取第一个图片的 URL
+        items = data.get("items", [])
+        if items:
+            image_url = items[0].get("url", "")
+            # 从 URL 中提取 CDN key: https://image.civitai.com/{KEY}/...
+            matches = re.findall(r'https://image\.civitai\.com/([^/]+)/', image_url)
 
-        if matches:
-            key = matches[0]
-            logger.info(f"成功获取 CDN Key: {key}")
-            return key
+            if matches:
+                key = matches[0]
+                logger.info(f"成功获取 CDN Key: {key}")
+                return key
 
-        logger.info("未在首页找到 CDN Key pattern")
+        logger.info("API 响应中未找到有效的 URL")
     except Exception as e:
         logger.warning(f"获取 CDN Key 失败: {e}")
 
