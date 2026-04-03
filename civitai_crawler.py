@@ -1,21 +1,71 @@
 """
 Civitai图片爬虫 - 抓取产品设计和工业设计相关图片
-使用 curl 命令行工具下载图片
+使用 requests 流式下载图片，支持动态获取 CDN key 和重试机制
 """
 import os
 import time
 import argparse
 import json
-import subprocess
+import logging
+import re
+import hashlib
+import shutil
 import requests
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 from fake_useragent import UserAgent
 from dotenv import load_dotenv
 from PIL import Image, UnidentifiedImageError
 
 # 加载环境变量
 load_dotenv()
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def get_cdn_key() -> str:
+    """
+    自动从 CivitAI 首页获取 CDN key
+    如果失败则使用已知的 fallback key
+    """
+    # 先检查环境变量
+    env_key = os.getenv("CIVITAI_CDN_KEY")
+    if env_key and env_key.strip():
+        logger.info(f"使用环境变量中的 CDN Key")
+        return env_key.strip()
+
+    logger.info("尝试自动获取 CDN Key...")
+    url = "https://civitai.com/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        content = response.text
+
+        # 查找 pattern: https://image.civitai.com/{KEY}/
+        matches = re.findall(r'https://image\.civitai\.com/([^/]+)/', content)
+
+        if matches:
+            key = matches[0]
+            logger.info(f"成功获取 CDN Key: {key}")
+            return key
+
+        logger.info("未在首页找到 CDN Key pattern")
+    except Exception as e:
+        logger.warning(f"获取 CDN Key 失败: {e}")
+
+    # Fallback key (已知的可用 key)
+    fallback = 'xG1nkqKTMzGDvpLrqFT7WA'
+    logger.info(f"使用 fallback CDN Key: {fallback}")
+    return fallback
 
 
 class CivitaiCrawler:
@@ -28,6 +78,9 @@ class CivitaiCrawler:
         # 使用 Session 保持会话
         self.session = requests.Session()
 
+        # 获取 CDN key
+        self.cdn_key = get_cdn_key()
+
         # 从环境变量读取代理配置
         _proxy = os.getenv("PROXY")
         if _proxy:
@@ -37,16 +90,8 @@ class CivitaiCrawler:
         else:
             self.proxies = None
 
-        # 从环境变量读取代理配置
-        _proxy = os.getenv("PROXY")
-        if _proxy:
-            _proxy_str = f"http://{_proxy}"
-            self.proxies = {"http": _proxy_str, "https": _proxy_str}
-        else:
-            self.proxies = None
-            
         self.target_years = [2025]
-        self.download_interval = 2  # 下载间隔（秒）
+        self.download_interval = 1  # 下载间隔（秒）,避免请求太快被限制
         self.include_keywords = ["industrial design", "product design", "product rendering"]
         self.exclude_keywords = ["anime", "cartoon", "fanart", "nsfw", "portrait", "fashion",
                                  "character", "woman", "man", "girl", "boy", "person", "human"]
@@ -54,6 +99,10 @@ class CivitaiCrawler:
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.fail_ids_file = Path("./.cache/fail_ids")
         self.fail_ids_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # 下载缓存目录
+        self.cache_dir = Path("./.cache/download_cache")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_fail_ids(self) -> set:
         """读取失败的id列表"""
@@ -165,54 +214,112 @@ class CivitaiCrawler:
         except Exception as e:
             return False, f"验证失败: {str(e)}"
 
-    def _download_with_curl(self, url: str, path: Path) -> bool:
-        """使用 curl 命令行工具下载图片"""
+    def _get_download_headers(self) -> Dict[str, str]:
+        """获取下载请求头"""
+        return {
+            "User-Agent": self.ua.random,
+            "Authorization": self.auth_token,
+            "Referer": "https://civitai.com/",
+            "Accept": "image/*"
+        }
+
+    def _check_cache(self, url: str) -> Optional[Path]:
+        """检查文件是否在缓存中"""
+        cache_key = hashlib.md5(url.encode()).hexdigest()
+        cache_path = self.cache_dir / cache_key
+        if cache_path.exists():
+            logger.debug(f"缓存命中: {url}")
+            return cache_path
+        return None
+
+    def _save_to_cache(self, url: str, source_path: Path):
+        """将下载的文件保存到缓存"""
+        cache_key = hashlib.md5(url.encode()).hexdigest()
+        cache_path = self.cache_dir / cache_key
         try:
-            cmd = [
-                "curl",
-                f"-Huser-agent: {self.ua.random}",
-                f"-Hauthorization: {self.auth_token}",
-                "-Hreferer: https://civitai.com/",
-                "-Haccept: image/*",
-                "-L",  # 跟随重定向
-                "-s",  # 静默模式
-                "-k",  # 跳过证书验证
-                "-o", str(path),
-                url,
-            ]
-
-            # 添加代理
-            if self.proxies:
-                proxy_url = self.proxies.get("https") or self.proxies.get("http")
-                if proxy_url:
-                    cmd.insert(-1, "-x")
-                    cmd.insert(-1, proxy_url)
-
-            result = subprocess.run(cmd, capture_output=True, timeout=60)
-
-            if result.returncode == 0 and path.exists() and path.stat().st_size > 0:
-                return True
-            else:
-                print(f"  [curl] 下载失败 (return code: {result.returncode})")
-                if result.stderr:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')
-                    if '401' in error_msg:
-                        print(f"  [curl] 认证失败 (401)")
-                    else:
-                        print(f"  [curl] 错误: {error_msg[:200]}")
-                        
-                time.sleep(0.5)
-                
-                return False
-        except FileNotFoundError:
-            print("  [curl] 未安装 curl")
-            return False
+            shutil.copy2(source_path, cache_path)
+            logger.debug(f"已缓存: {url}")
         except Exception as e:
-            print(f"  [curl] 失败: {e}")
-            return False
+            logger.warning(f"缓存保存失败: {e}")
+
+    def _download_with_requests(self, url: str, path: Path, max_retries: int = 3) -> bool:
+        """
+        使用 requests 流式下载图片（参考 CivitAI-Collection-Downloader）
+        支持重试机制和缓存
+        """
+        # 检查缓存
+        cached_file = self._check_cache(url)
+        if cached_file:
+            try:
+                shutil.copy2(cached_file, path)
+                logger.debug(f"从缓存恢复: {path}")
+                return True
+            except Exception as e:
+                logger.warning(f"从缓存复制失败: {e}")
+
+        headers = self._get_download_headers()
+
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"下载尝试 {attempt + 1}/{max_retries}: {url}")
+
+                # 流式下载
+                with self.session.get(url, headers=headers, stream=True, timeout=60) as response:
+                    response.raise_for_status()
+
+                    # 先写入临时文件
+                    temp_path = path.with_suffix('.tmp')
+                    with open(temp_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    # 验证文件大小
+                    if temp_path.stat().st_size == 0:
+                        temp_path.unlink()
+                        raise ValueError("下载的文件大小为0")
+
+                    # 重命名为最终文件名
+                    temp_path.replace(path)
+
+                    # 保存到缓存
+                    self._save_to_cache(url, path)
+
+                    logger.debug(f"下载成功: {path}")
+                    return True
+
+            except requests.RequestException as e:
+                logger.warning(f"请求失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    status = e.response.status_code
+                    logger.debug(f"HTTP状态码: {status}")
+                    if status == 401:
+                        logger.error("认证失败 (401)，请检查 auth_token")
+                        return False
+                    elif status == 404:
+                        logger.error("图片不存在 (404)")
+                        return False
+                    elif status == 429:
+                        retry_after = e.response.headers.get('Retry-After')
+                        wait_time = int(retry_after) if retry_after else 5
+                        logger.info(f"请求频率限制，等待 {wait_time} 秒...")
+                        time.sleep(wait_time)
+            except Exception as e:
+                logger.warning(f"下载失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+
+            # 最后一次尝试不需要等待
+            if attempt < max_retries - 1:
+                delay = (attempt + 1) * 1  # 递增延迟
+                time.sleep(delay)
+
+        logger.error(f"下载失败，已重试 {max_retries} 次: {url}")
+        return False
 
     def _save_item(self, item: Dict) -> bool:
-        """保存单个item（图片+json）"""
+        """
+        保存单个item（图片+json）
+        使用新的下载方式（参考 CivitAI-Collection-Downloader）
+        """
         url = item.get("url", "")
         item_id = item.get("id")
         created_at = item.get("createdAt", "")
@@ -221,23 +328,28 @@ class CivitaiCrawler:
         base_name = os.path.splitext(url.rstrip("/").split("/")[-1])[0]
         ext = os.path.splitext(url.rstrip("/").split("/")[-1])[1] or ".jpg"
 
-        # 文件名添加年份前缀
-        filename = f"{year}_{base_name}"
+        # 文件名格式: {年份}_{id}_{原url值(uuid)}
+        filename = f"{year}_{item_id}_{base_name}"
         image_path = self.image_dir / f"{filename}{ext}"
         json_path = self.image_dir / f"{filename}.json"
 
         # 检查文件是否已存在
         if image_path.exists() and json_path.exists():
+            logger.debug(f"文件已存在，跳过: {filename}")
             return False  # 已存在，跳过
 
-        # 构建图片 URL
-        image_url = f"https://image-b2.civitai.com/file/civitai-media-cache/{url}/original"
+        # 构建图片 URL（使用动态 CDN key）
+        # 参考: https://image.civitai.com/{cdn_key}/{url}/original=true
+        image_url = f"https://image.civitai.com/{self.cdn_key}/{url}/original=true"
 
-        # 使用 curl 下载图片
-        print(f"  下载中...", end=" ")
-        if not self._download_with_curl(image_url, image_path):
+        logger.info(f"正在下载图片: {image_url}")
+        logger.debug(f"图片 URL: {image_url}")
+
+        # 使用 requests 流式下载
+        if not self._download_with_requests(image_url, image_path):
             self._add_fail_id(item_id)
-            print(f"下载失败: ID={item_id}")
+            logger.error(f"下载失败: ID={item_id}")
+            logger.info(f"详情地址: https://civitai.com/images/{item_id}")
             return False
 
         # 验证图片完整性
@@ -247,11 +359,12 @@ class CivitaiCrawler:
             if image_path.exists():
                 image_path.unlink()
             self._add_fail_id(item_id)
-            print(f"校验失败: {error_msg}, ID={item_id} \n 下载地址: {image_url} \n 详情地址: https://civitai.com/images/{item_id} \n")
-            time.sleep(0.5)
+            logger.error(f"校验失败: {error_msg}, ID={item_id}")
+            logger.info(f"下载地址: {image_url}")
+            logger.info(f"详情地址: https://civitai.com/images/{item_id}")
             return False
 
-        print("成功!")
+        logger.info(f"下载成功: {filename} | https://civitai.com/images/{item_id}")
 
         # 保存json
         json_data = {
@@ -270,9 +383,10 @@ class CivitaiCrawler:
 
     def crawl(self, max_pages: int = None, items_per_page: int = 51):
         """爬取数据并下载图片"""
-        print(f"开始爬取 Civitai 图片...")
-        print(f"目标年份: {self.target_years}")
-        print(f"关键词: {self.include_keywords}")
+        logger.info("开始爬取 Civitai 图片...")
+        logger.info(f"目标年份: {self.target_years}")
+        logger.info(f"关键词: {self.include_keywords}")
+        logger.info(f"CDN Key: {self.cdn_key[:10]}...")  # 只显示前10个字符
 
         offset = 0
         page_count = 0
@@ -281,30 +395,35 @@ class CivitaiCrawler:
 
         while True:
             if max_pages and page_count >= max_pages:
+                logger.info(f"已达到最大页数限制: {max_pages}")
                 break
 
             items, hits = self._fetch_page(offset, items_per_page)
-            
+
             if not hits:
-                print("没有更多数据")
+                logger.info("没有更多数据")
                 break
-            
+
             if not items:
+                logger.debug("当前页没有符合条件的项目，继续下一页")
+                offset += items_per_page
                 continue
 
             page_count += 1
             offset += items_per_page
             total_found += len(items)
 
+            logger.info(f"第{page_count}页: 找到 {len(items)} 条符合条件的")
+
             # 下载
             downloaded = sum(1 for item in items if self._save_item(item))
             skipped = len(items) - downloaded
             total_downloaded += downloaded
 
-            print(f"第{page_count}页: 找到{len(items)}条, 下载{downloaded}张, 跳过{skipped}张")
+            logger.info(f"第{page_count}页完成: 下载 {downloaded} 张, 跳过 {skipped} 张")
             time.sleep(self.download_interval)
 
-        print(f"\n完成! 共找到{total_found}条, 下载{total_downloaded}张")
+        logger.info(f"爬取完成! 共找到 {total_found} 条, 下载 {total_downloaded} 张")
 
 
 if __name__ == "__main__":
