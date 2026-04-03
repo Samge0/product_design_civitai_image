@@ -429,7 +429,7 @@ class CivitaiCrawler:
             image_url = f"https://image.civitai.com/{self.cdn_key}/{url}/original=true"
 
             if attempt == 0:
-                logger.info(f"正在下载图片: {filename}")
+                logger.info(f"正在下载图片: {image_url}")
             else:
                 logger.info(f"使用新 CDN Key 重试下载: {filename}")
 
@@ -527,18 +527,20 @@ class CivitaiCrawler:
                     logger.info(f"已达到最大页数限制: {max_pages}")
                     break
 
+                logger.info(f"正在获取第 {page_count + 1} 页数据 (offset={offset})...")
                 items, hits = self._fetch_page(offset, items_per_page)
+                logger.info(f"第 {page_count + 1} 页数据获取完成，原始数据 {len(hits)} 条，符合条件 {len(items)} 条")
 
                 if not hits:
                     logger.info("没有更多数据")
                     break
 
+                page_count += 1
+
                 if not items:
-                    logger.debug("当前页没有符合条件的项目，继续下一页")
+                    logger.info(f"第{page_count}页: 没有符合条件的项目，继续下一页")
                     offset += items_per_page
                     continue
-
-                page_count += 1
                 offset += items_per_page
                 total_found += len(items)
 
