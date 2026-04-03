@@ -104,7 +104,7 @@ class CivitaiCrawler:
         years_suffix = "_".join(str(y) for y in sorted(self.target_years, reverse=True))
         self.image_dir = Path(f"./.cache/civitai_com_image_results_{years_suffix}")
         self.image_dir.mkdir(parents=True, exist_ok=True)
-        self.fail_ids_file = Path("./.cache/fail_ids")
+        self.fail_ids_file = Path(f"./.cache/fail_ids_{years_suffix}")
         self.fail_ids_file.parent.mkdir(parents=True, exist_ok=True)
 
         # 下载缓存目录
@@ -112,7 +112,7 @@ class CivitaiCrawler:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         # 进度文件
-        self.progress_file = Path("./.cache/crawl_progress.json")
+        self.progress_file = Path(f"./.cache/crawl_progress_{years_suffix}.json")
         self.progress_file.parent.mkdir(parents=True, exist_ok=True)
 
         # CDN key 更新标志（避免频繁更新）
