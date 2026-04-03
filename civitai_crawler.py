@@ -93,10 +93,10 @@ class CivitaiCrawler:
 
         self.target_years = [2025]
         self.download_interval = 1  # 下载间隔（秒）,避免请求太快被限制
-        self.include_keywords = ["industrial design", "product design", "product rendering"]
-        self.exclude_keywords = ["anime", "cartoon", "fanart", "nsfw", "portrait", "fashion",
-                                 "character", "woman", "man", "girl", "boy", "person", "human"]
-        self.image_dir = Path("./.cache/civitai_com_image_results")
+        self.include_keywords = ["industrial design", "product design", "product rendering","product"]
+        self.exclude_keywords = ["anime", "cartoon", "fanart", "nsfw", "portrait",
+                                 "character", "woman", "man", "girl", "boy", "person", "human","animal","furry","girl"]
+        self.image_dir = Path("./.cache/civitai_com_image_results_2025")
         self.image_dir.mkdir(parents=True, exist_ok=True)
         self.fail_ids_file = Path("./.cache/fail_ids")
         self.fail_ids_file.parent.mkdir(parents=True, exist_ok=True)
@@ -230,11 +230,18 @@ class CivitaiCrawler:
 
             except requests.RequestException as e:
                 error_str = str(e)
+                _eno = getattr(e, "errno", None)
                 is_connection_error = (
-                    'ConnectionResetError' in error_str or
-                    'Connection aborted' in error_str or
-                    '远程主机强迫关闭' in error_str or
-                    errno.ECONNRESET in getattr(e, 'errno', 0)
+                    "ConnectionResetError" in error_str
+                    or "Connection aborted" in error_str
+                    or "远程主机强迫关闭" in error_str
+                    or "Unable to connect to proxy" in error_str
+                    or "积极拒绝" in error_str
+                    or "408" in error_str
+                    or "Request Timeout" in error_str
+                    or "Read timed out" in error_str
+                    or isinstance(e, requests.exceptions.Timeout)
+                    or (_eno is not None and _eno == errno.ECONNRESET)
                 )
 
                 # 判断是否需要重试
