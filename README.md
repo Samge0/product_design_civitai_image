@@ -164,3 +164,50 @@ CIVITAI_CDN_KEY=your_key_here
 - `requests` - HTTP 请求库
 - `Pillow` - 图片验证
 - `fake-useragent` - 随机 User-Agent
+
+
+### 修复缺失的 JSON 文件 (备选方案)
+
+使用 `fix-json.py` 脚本可以单独修复缺失 JSON 的图片文件：
+
+```bash
+# 修复所有缺失的 JSON 文件
+python fix-json.py
+
+# 修复前 10 个文件
+python fix-json.py --limit 10
+
+# 从第 50 个文件开始修复（断点续传）
+python fix-json.py --start 50
+
+# 组合使用：从第 50 个开始，修复 20 个
+python fix-json.py --start 50 --limit 20
+```
+
+**修复原理：**
+
+1. 从图片文件名中提取 Civitai 图片 ID（格式：`{年份}_{id}_{uuid}.jpg`）
+2. 请求 `https://civitai.com/images/{id}` 获取页面 HTML
+3. 从 `<script id="__NEXT_DATA__">` 标签中提取页面数据
+4. 使用 postId 请求 API `https://civitai.com/api/v1/images?limit=1&postId={postId}` 获取完整数据
+5. 合并两个数据源，生成 JSON 文件
+
+**数据源映射：**
+
+| JSON 字段 | 数据来源 |
+|-----------|----------|
+| `id` | 页面数据 |
+| `postId` | 页面数据 |
+| `prompt` | API 数据 (`meta.prompt`) |
+| `type` | 页面数据 |
+| `generationProcess` | API 数据 (`meta.workflow`) |
+| `createdAt` | 页面数据 |
+| `name` | 页面数据 |
+| `aspectRatio` | 根据宽高计算 (Landscape/Portrait/Square) |
+| `user.id` | 页面数据 |
+| `user.username` | 页面数据 |
+| `baseModel` | API 数据 |
+
+**已知问题：**
+
+- `generationProcess` 字段无法从 API 数据中获取（`meta.workflow` 返回空值），该字段在生成的 JSON 中将为空字符串
