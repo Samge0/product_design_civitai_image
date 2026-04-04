@@ -78,7 +78,9 @@ class CivitaiCrawler:
     def __init__(self):
         self.ua = UserAgent()
         self.api_url = "https://search-new.civitai.com/multi-search"
-        self.auth_token = f"Bearer 8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61"
+        
+        toekn_value = os.getenv("TOKEN") or "8c46eb2508e21db1e9828a97968d91ab1ca1caa5f70a00e88a2ba1e286603b61"
+        self.auth_token = f"Bearer {toekn_value}"
 
         # 使用 Session 保持会话
         self.session = requests.Session()
